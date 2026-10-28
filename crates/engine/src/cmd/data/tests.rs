@@ -507,3 +507,21 @@ fn a_rule_with_an_unknown_type_operator_or_error_style_is_refused() {
     assert_eq!(sh.validations.len(), 3);
     assert!(check_validation(&s.doc().unwrap().wb, 0, CellRef::parse("A2").unwrap(), "0").is_some());
 }
+
+#[test]
+fn filter_values_lists_every_distinct_value_of_a_large_column() {
+    // 100k rows, 50k distinct values: the dropdown list must hold every one of them.
+    let n = 100_000usize;
+    let mut s = Session::new();
+    s.new_workbook();
+    let mut rows: Vec<Json> = Vec::with_capacity(n + 1);
+    rows.push(json!(["Name"]));
+    for i in 0..n {
+        rows.push(json!([format!("item-{}", i % 50_000)]));
+    }
+    s.execute("range.setValues", json!({"range": "A1", "values": rows})).unwrap();
+    s.execute("data.filter", json!({"range": format!("A1:A{}", n + 1)})).unwrap();
+    let wb = s.doc().unwrap().wb.clone();
+    let vals = filter_values(&wb, 0, 0);
+    assert_eq!(vals.len(), 50_000, "every distinct value is listed");
+}

@@ -3,6 +3,18 @@ use super::geo::Geo;
 use super::tables::filter_table_range;
 use super::{Arc, Drag, FillTag, RangeRef, Rect, Sense, Sheet, SheetApp, Stroke, Tokens, col_to_letters, json, pos2, vec2};
 
+/// What the filter popup keeps between frames: every distinct value with its checked state, the search
+/// text the match list was built for, and the indices of the values matching that search.
+struct ListState {
+    checks: Vec<(String, bool)>,
+    needle: String,
+    shown: Vec<usize>,
+}
+
+/// The popup's value list behind an `Arc`, so reading it from egui's temp data each frame is a cheap clone.
+#[derive(Clone)]
+struct FilterList(Arc<egui::mutex::Mutex<ListState>>);
+
 /// Draws the filter-header popup: sort, search/select-all, apply/clear, a lazily installed table autofilter, new-open search focus and dismissal.
 pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool) {
     let Some((col, row, at)) = app.grid.filter_menu else { return };
@@ -31,7 +43,6 @@ pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_
         }
     }
     let wb = app.session.active().map(|d| d.wb.clone()).unwrap_or(wb);
-    let values = gridcraft_engine::cmd::data::filter_values(&wb, si, col);
     let key = egui::Id::unique(("filter_sel", col));
     let search_key = egui::Id::unique(("filter_search", col));
     let buttons_key = egui::Id::unique(("filter_buttons", col));
@@ -57,7 +68,19 @@ pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_
             }
             ui.separator();
             ui.label(egui::RichText::new("Filter").strong());
-            let mut checks: Vec<(String, bool)> = ui.ctx().data_mut(|d| d.get_temp::<Vec<(String, bool)>>(key)).unwrap_or(values.clone());
+            // The value list is built once, when the menu opens (a full column scan), and shared between
+            // frames by `Arc`: rebuilding or cloning it every frame made large columns crawl.
+            let list: FilterList = match ui.ctx().data_mut(|d| d.get_temp::<FilterList>(key)) {
+                Some(l) => l,
+                None => {
+                    let checks = gridcraft_engine::cmd::data::filter_values(&wb, si, col);
+                    let shown = (0..checks.len()).collect();
+                    let l = FilterList(Arc::new(egui::mutex::Mutex::new(ListState { checks, needle: String::new(), shown })));
+                    ui.ctx().data_mut(|d| d.insert_temp(key, l.clone()));
+                    l
+                }
+            };
+            let mut st = list.0.lock();
             // A search narrows the list; Select All and Apply then only cover the matches.
             let mut search: String = ui.ctx().data_mut(|d| d.get_temp(search_key)).unwrap_or_default();
             let field = ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search").desired_width(f32::INFINITY));
@@ -65,27 +88,43 @@ pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_
                 field.request_focus();
             }
             let needle = search.trim().to_lowercase();
-            let matches = |v: &str| needle.is_empty() || v.to_lowercase().contains(&needle);
-            let all = checks.iter().filter(|(v, _)| matches(v)).all(|(_, b)| *b);
+            if needle != st.needle {
+                // Only a changed search text rescans the values.
+                let shown: Vec<usize> = st
+                    .checks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (v, _))| needle.is_empty() || v.to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect();
+                st.shown = shown;
+                st.needle = needle.clone();
+            }
+            let all = st.shown.iter().all(|&i| st.checks.get(i).is_none_or(|c| c.1));
             let mut all_new = all;
             let label = if needle.is_empty() { "(Select All)" } else { "(Select All Search Results)" };
             if ui.checkbox(&mut all_new, label).changed() {
-                for c in checks.iter_mut().filter(|(v, _)| matches(v)) {
-                    c.1 = all_new;
+                let ListState { checks, shown, .. } = &mut *st;
+                for &i in shown.iter() {
+                    if let Some(c) = checks.get_mut(i) {
+                        c.1 = all_new;
+                    }
                 }
             }
             // Full width: shrunk to the longest value, the scroll bar sat mid-menu and the wheel only
-            // worked over the values themselves (#432).
-            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                for (v, on) in checks.iter_mut().filter(|(v, _)| matches(v)) {
-                    ui.checkbox(on, v.as_str());
+            // worked over the values themselves (#432). Only the visible rows are laid out, so a
+            // column with tens of thousands of distinct values scrolls as smoothly as a short one.
+            let row_h = ui.spacing().interact_size.y;
+            let total = st.shown.len();
+            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show_rows(ui, row_h, total, |ui, range| {
+                let ListState { checks, shown, .. } = &mut *st;
+                for i in range {
+                    if let Some(c) = shown.get(i).and_then(|&idx| checks.get_mut(idx)) {
+                        ui.checkbox(&mut c.1, c.0.as_str());
+                    }
                 }
             });
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(key, checks.clone());
-                d.insert_temp(search_key, search.clone());
-            });
-            let checks: Vec<(String, bool)> = checks.iter().map(|(v, on)| (v.clone(), *on && matches(v))).collect();
+            ui.ctx().data_mut(|d| d.insert_temp(search_key, search.clone()));
             ui.separator();
             ui.horizontal(|ui| {
                 let clear = ui.button("Clear Filter");
@@ -94,13 +133,22 @@ pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_
                     close = true;
                 }
                 // Nothing checked would hide every row, so Enter (unlike a click on Apply) does nothing then.
-                let any = checks.iter().any(|(_, on)| *on);
+                let any = st.shown.iter().any(|&i| st.checks.get(i).is_some_and(|c| c.1));
                 let apply = ui.button("Apply");
                 ui.ctx().data_mut(|d| d.insert_temp(buttons_key, vec![ascending.id, descending.id, clear.id, apply.id]));
                 if apply.clicked() || (enter && any) {
-                    let blanks = checks.iter().any(|(v, on)| v == "(Blanks)" && *on);
-                    let vals: Vec<String> = checks.iter().filter(|(v, on)| *on && v != "(Blanks)").map(|(v, _)| v.clone()).collect();
-                    let p = if checks.iter().all(|(_, b)| *b) {
+                    // A value counts only if it is checked and matches the search.
+                    let mut visible = vec![false; st.checks.len()];
+                    for &i in &st.shown {
+                        if let Some(x) = visible.get_mut(i) {
+                            *x = true;
+                        }
+                    }
+                    let picked: Vec<(&String, bool)> =
+                        st.checks.iter().enumerate().map(|(i, (v, on))| (v, *on && visible.get(i).copied().unwrap_or(false))).collect();
+                    let blanks = picked.iter().any(|(v, on)| v.as_str() == "(Blanks)" && *on);
+                    let vals: Vec<String> = picked.iter().filter(|(v, on)| *on && v.as_str() != "(Blanks)").map(|(v, _)| (*v).clone()).collect();
+                    let p = if picked.iter().all(|(_, b)| *b) {
                         json!({"column": col_to_letters(col), "clear": true})
                     } else {
                         json!({"column": col_to_letters(col), "values": vals, "blanks": blanks})
@@ -113,7 +161,7 @@ pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_
     });
     if close || popup_dismissed(&response.response, was_open) {
         ui.ctx().data_mut(|d| {
-            d.remove::<Vec<(String, bool)>>(key);
+            d.remove::<FilterList>(key);
             d.remove::<String>(search_key);
             d.remove::<Vec<egui::Id>>(buttons_key);
         });
